@@ -1,4 +1,4 @@
-name: yt downloader deepseek improved
+name: yt download deepseek
 
 on:
   workflow_dispatch:
@@ -18,16 +18,33 @@ on:
         default: 'mp4 (video)'
 
       desired_quality:
-        description: 'کیفیت (ویدیو: 144p, 240p, 360p, 480p, 720p, 1080p | صدا: 64kbps, 128kbps, 192kbps, 320kbps)'
-        required: false
-        type: string
-        default: '720p'
+        description: 'کیفیت (بسته به نوع خروجی انتخاب می‌شود)'
+        required: true
+        type: choice
+        options:
+          # Video qualities
+          - 'Video: 2160p (4K)'
+          - 'Video: 1440p (2K)'
+          - 'Video: 1080p (Full HD)'
+          - 'Video: 720p (HD)'
+          - 'Video: 480p'
+          - 'Video: 360p'
+          - 'Video: 240p'
+          - 'Video: 144p'
+          # Audio qualities
+          - 'Audio: 320kbps (best)'
+          - 'Audio: 256kbps'
+          - 'Audio: 192kbps (high)'
+          - 'Audio: 128kbps (normal)'
+          - 'Audio: 64kbps (low)'
+          - 'Audio: 48kbps'
+        default: 'Video: 720p (HD)'
 
       max_part_mb:
         description: 'حداکثر حجم هر قسمت (MB) - 0 = خودکار ۱۸۰۰ مگابایت'
         required: false
         type: string
-        default: '0'
+        default: '90'
 
       upload_method:
         description: '📤 روش ذخیره نهایی'
@@ -36,16 +53,10 @@ on:
         options:
           - repository (push to repo)
           - release (GitHub Releases)
-        default: 'release (GitHub Releases)'
+        default: 'repository (push to repo)'
 
       release_tag:
-        description: '🏷️ نام تگ ریلیز (فقط در صورت انتخاب Release - خالی = خودکار)'
-        required: false
-        type: string
-        default: ''
-
-      custom_filename:
-        description: '📝 نام فایل سفارشی (خالی = نام خودکار)'
+        description: '🏷️ نام تگ ریلیز (فقط در صورت انتخاب Release)'
         required: false
         type: string
         default: ''
@@ -56,7 +67,7 @@ permissions:
 jobs:
   youtube-download:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
 
     steps:
       - name: 📂 Checkout Repository
@@ -67,223 +78,190 @@ jobs:
       - name: 🔧 Install Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y zip curl python3 python3-pip ffmpeg
-          pip3 install --quiet requests yt-dlp
+          sudo apt-get install -y zip curl python3 python3-pip
+          pip3 install --quiet requests
 
-      - name: 🔍 Validate Input
-        id: validate
-        run: |
-          # Validate URL format
-          if [[ ! "${{ github.event.inputs.video_url }}" =~ ^https?://(www\.)?(youtube\.com|youtu\.be)/ ]]; then
-            echo "::error::Invalid YouTube URL format"
-            exit 1
-          fi
-          
-          # Validate quality
-          VALID_VIDEO_QUALITIES=("144p" "240p" "360p" "480p" "720p" "1080p")
-          VALID_AUDIO_QUALITIES=("64kbps" "128kbps" "192kbps" "320kbps")
-          QUAL="${{ github.event.inputs.desired_quality }}"
-          FORMAT="${{ github.event.inputs.output_format }}"
-          
-          if [[ "$FORMAT" == "mp4 (video)" ]]; then
-            if [[ ! " ${VALID_VIDEO_QUALITIES[@]} " =~ " ${QUAL} " ]]; then
-              echo "::warning::Invalid video quality '$QUAL', falling back to 720p"
-              echo "quality=720p" >> $GITHUB_OUTPUT
-            else
-              echo "quality=$QUAL" >> $GITHUB_OUTPUT
-            fi
-          else
-            if [[ ! " ${VALID_AUDIO_QUALITIES[@]} " =~ " ${QUAL} " ]]; then
-              echo "::warning::Invalid audio quality '$QUAL', falling back to 192kbps"
-              echo "quality=192kbps" >> $GITHUB_OUTPUT
-            else
-              echo "quality=$QUAL" >> $GITHUB_OUTPUT
-            fi
-          fi
-
-      - name: 📥 Download with yt-dlp
-        id: download
+      - name: 🔗 Get Download Link
+        id: retrieve
         run: |
           python3 << 'EOF'
-          import os, re, subprocess, json, sys
-          
-          URL = os.environ.get('INPUT_URL')
-          FMT = os.environ.get('INPUT_FORMAT')
-          QUAL = os.environ.get('INPUT_QUALITY')
-          CUSTOM_NAME = os.environ.get('CUSTOM_FILENAME', '').strip()
-          
+          import os, sys, time, re, requests
+
+          URL  = os.environ.get('INPUT_URL')
+          FMT  = os.environ.get('INPUT_FORMAT')
+          QUAL_CHOICE = os.environ.get('INPUT_QUALITY')
+
           is_audio = FMT == 'mp3'
           
-          # Get video info first
-          info_cmd = ['yt-dlp', '--dump-json', '--no-playlist', URL]
-          result = subprocess.run(info_cmd, capture_output=True, text=True)
-          if result.returncode != 0:
-              print("::error::Failed to get video info")
-              sys.exit(1)
-          
-          info = json.loads(result.stdout)
-          title = info.get('title', 'video')
-          vid = info.get('id', 'unknown')
-          
-          # Clean filename
-          if CUSTOM_NAME:
-              clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', CUSTOM_NAME.replace(' ', '_'))
+          # Parse quality from the choice
+          if is_audio:
+              # Extract audio bitrate from selection
+              if '320kbps' in QUAL_CHOICE:
+                  QUAL = '320kbps'
+              elif '256kbps' in QUAL_CHOICE:
+                  QUAL = '256kbps'
+              elif '192kbps' in QUAL_CHOICE:
+                  QUAL = '192kbps'
+              elif '128kbps' in QUAL_CHOICE:
+                  QUAL = '128kbps'
+              elif '64kbps' in QUAL_CHOICE:
+                  QUAL = '64kbps'
+              elif '48kbps' in QUAL_CHOICE:
+                  QUAL = '48kbps'
+              else:
+                  QUAL = '192kbps'  # default
           else:
-              clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
-          clean = re.sub(r'_+', '_', clean).strip('_')[:100] or vid
+              # Extract video quality from selection
+              if '2160p' in QUAL_CHOICE:
+                  QUAL = '2160p'
+              elif '1440p' in QUAL_CHOICE:
+                  QUAL = '1440p'
+              elif '1080p' in QUAL_CHOICE:
+                  QUAL = '1080p'
+              elif '720p' in QUAL_CHOICE:
+                  QUAL = '720p'
+              elif '480p' in QUAL_CHOICE:
+                  QUAL = '480p'
+              elif '360p' in QUAL_CHOICE:
+                  QUAL = '360p'
+              elif '240p' in QUAL_CHOICE:
+                  QUAL = '240p'
+              elif '144p' in QUAL_CHOICE:
+                  QUAL = '144p'
+              else:
+                  QUAL = '720p'  # default
+
+          payload = {
+              "url": URL,
+              "os": "linux",
+              "output": {"type": "audio" if is_audio else "video", "format": FMT}
+          }
+          if is_audio:
+              payload["audio"] = {"bitrate": QUAL}
+          else:
+              payload["output"]["quality"] = QUAL
+
+          s = requests.Session()
+          s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+          s.get("https://media.ytmp3.gg/")
+
+          resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
+          resp.raise_for_status()
+          data = resp.json()
+
+          status_url = data.get('statusUrl')
+          title = data.get('title', 'video')
+
+          dl_url = None
+          for _ in range(150):
+              time.sleep(2)
+              r = s.get(status_url, timeout=20)
+              status = r.json()
+              if status.get('status') == 'completed':
+                  dl_url = status.get('downloadUrl')
+                  break
+              if status.get('status') == 'failed':
+                  print("::error::Server failed to prepare the video")
+                  sys.exit(1)
+
+          if not dl_url:
+              print("::error::Could not get download link")
+              sys.exit(1)
+
+          vid   = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', URL)[1]
+          clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
+          clean = re.sub(r'_+', '_', clean).strip('_')[:70] or vid
           clean = clean.lstrip('-')
           
-          # Determine format selection
-          if is_audio:
-              bitrate = QUAL.replace('kbps', '')
-              format_sel = f'bestaudio[abr<={bitrate}]/bestaudio'
-              ext = 'mp3'
-              postprocessors = ['-x', '--audio-format', 'mp3', '--audio-quality', bitrate]
-          else:
-              height = QUAL.replace('p', '')
-              format_sel = f'bestvideo[height<={height}]+bestaudio/best[height<={height}]/best'
-              ext = 'mp4'
-              postprocessors = ['--merge-output-format', 'mp4']
-          
-          fname = f"{clean}_{vid}_{QUAL}.{ext}"
-          
-          # Download with yt-dlp
-          os.makedirs('release_files', exist_ok=True)
-          cmd = [
-              'yt-dlp',
-              '-f', format_sel,
-              '-o', f'release_files/{fname}',
-              '--no-playlist',
-              '--no-check-certificates',
-              '--retries', '5',
-              '--fragment-retries', '5',
-              '--socket-timeout', '30',
-          ] + postprocessors + [URL]
-          
-          print(f"Downloading: {fname}")
-          print(f"Command: {' '.join(cmd)}")
-          
-          result = subprocess.run(cmd, capture_output=True, text=True)
-          if result.returncode != 0:
-              print(f"::error::Download failed: {result.stderr}")
-              sys.exit(1)
-          
-          # Verify file
-          filepath = f'release_files/{fname}'
-          if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
-              # Try to find downloaded file
-              files = os.listdir('release_files')
-              if files:
-                  fname = files[0]
-                  filepath = f'release_files/{fname}'
-              else:
-                  print("::error::No file downloaded")
-                  sys.exit(1)
-          
-          filesize = os.path.getsize(filepath)
-          print(f"Downloaded: {fname} ({filesize / 1024 / 1024:.1f} MB)")
-          
-          with open('.download_info', 'w', encoding='utf-8') as f:
-              f.write(f"{fname}\n{title}\n{vid}")
-          
+          # Use simplified quality name for filename
+          quality_simple = QUAL.replace('kbps', '').replace('p', '')
+          fname = f"{clean}_{vid}_{quality_simple}.{FMT}"
+
+          with open(".download_info", "w", encoding="utf-8") as f:
+              f.write(f"{dl_url}\n{fname}\n{title}")
+
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"filename={fname}\n")
               f.write(f"title={title}\n")
-              f.write(f"filesize={filesize}\n")
+              f.write(f"quality={QUAL}\n")
           EOF
         env:
-          INPUT_URL: ${{ github.event.inputs.video_url }}
-          INPUT_FORMAT: ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
-          INPUT_QUALITY: ${{ steps.validate.outputs.quality }}
-          CUSTOM_FILENAME: ${{ github.event.inputs.custom_filename }}
+          INPUT_URL:     ${{ github.event.inputs.video_url }}
+          INPUT_FORMAT:  ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
+          INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
+
+      - name: 📥 Download File
+        run: |
+          DL_URL=$(head -1 .download_info)
+          FILENAME=$(sed -n '2p' .download_info)
+          mkdir -p release_files
+          echo "Downloading: $FILENAME"
+          curl -L --fail --progress-bar -o "release_files/$FILENAME" "$DL_URL"
+          if [ ! -s "release_files/$FILENAME" ]; then
+            echo "::error::Downloaded file is empty!"
+            exit 1
+          fi
 
       - name: ✂️ Split Large File (if needed)
         run: |
-          FILENAME="${{ steps.download.outputs.filename }}"
+          FILENAME="${{ steps.retrieve.outputs.filename }}"
           THRESH_MB="${{ github.event.inputs.max_part_mb }}"
-          
-          # Default to 1800MB if 0 or invalid
           if [[ "$THRESH_MB" -le 0 ]] || [[ "$THRESH_MB" -gt 1900 ]]; then
             THRESH_MB=1800
           fi
-          
-          cd release_files
-          FILESIZE=$(stat -c%s "$FILENAME" 2>/dev/null || echo 0)
+          FILESIZE=$(stat -c%s "release_files/$FILENAME" 2>/dev/null || echo 0)
           THRESH_BYTES=$((THRESH_MB * 1024 * 1024))
-          
+
           if [ "$FILESIZE" -gt "$THRESH_BYTES" ]; then
-            echo "🔪 Splitting ${FILENAME} into ${THRESH_MB}MB parts..."
+            echo "🔪 Splitting into ${THRESH_MB}MB parts..."
             BASE="${FILENAME%.*}"
+            cd release_files
             zip -r -s "${THRESH_MB}m" "${BASE}.zip" "./$FILENAME"
             rm -- "$FILENAME"
-            echo "✅ Split complete. Parts:"
-            ls -lh *.z* 2>/dev/null || ls -lh
+            cd ..
+            echo "Parts created:"
+            ls -lh release_files/
           else
             echo "📦 No split needed ($(( FILESIZE / 1024 / 1024 )) MB)"
           fi
-          cd ..
-
-      - name: 📊 Generate File List
-        run: |
-          echo "### 📁 Files to Upload" >> $GITHUB_STEP_SUMMARY
-          ls -lh release_files/ | tail -n +2 >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
 
       - name: 📅 Get Current Date
         id: get_date
-        run: echo "date=$(date '+%Y-%m-%d %H:%M:%S %Z')" >> $GITHUB_OUTPUT
+        run: echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
 
       - name: 📤 Push to Repository
         if: github.event.inputs.upload_method == 'repository (push to repo)'
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Create date-based folder structure
-          FOLDER="downloads/$(date '+%Y/%m')"
-          mkdir -p "$FOLDER"
-          
-          mv release_files/* "$FOLDER/"
-          
-          git add "$FOLDER/"
-          git commit -m "⬇️ YouTube: ${{ steps.download.outputs.filename }} [skip ci]" || echo "Nothing to commit"
-          git pull --rebase
+          mkdir -p downloads
+          mv release_files/* downloads/
+          git add downloads/
+          git commit -m "⬇️ YouTube: ${{ steps.retrieve.outputs.filename }} [skip ci]" || echo "Nothing to commit"
           git push
 
       - name: 📤 Upload to GitHub Releases
         if: github.event.inputs.upload_method == 'release (GitHub Releases)'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('yt-{0}-{1}', github.run_number, steps.download.outputs.filename) }}
-          name: ${{ format('📽️ {0}', steps.download.outputs.filename) }}
+          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('yt-{0}', github.run_number) }}
+          name: ${{ format('YouTube - {0}', steps.retrieve.outputs.filename) }}
           body: |
-            ## 📽️ YouTube Download
-            
-            | Detail | Value |
-            |--------|-------|
-            | **Title** | ${{ steps.download.outputs.title }} |
-            | **Original URL** | ${{ github.event.inputs.video_url }} |
-            | **Quality** | ${{ steps.validate.outputs.quality }} |
-            | **Format** | ${{ github.event.inputs.output_format }} |
-            | **Downloaded** | ${{ steps.get_date.outputs.date }} |
-            | **File Size** | ${{ steps.download.outputs.filesize }} bytes |
-            
+            **📽️ YouTube Download**
+
+            **Title:** ${{ steps.retrieve.outputs.title }}
+            **Original Link:** ${{ github.event.inputs.video_url }}
+            **Quality:** ${{ steps.retrieve.outputs.quality }}
+            **Format:** ${{ github.event.inputs.output_format }}
+            **Downloaded on:** ${{ steps.get_date.outputs.date }}
+
             ---
-            🤖 Powered by GitHub Actions | ⚡ Meli-Action
+            Powered by Meli-Action ⚡
           files: release_files/*
           token: ${{ secrets.GITHUB_TOKEN }}
           draft: false
           prerelease: false
-          generate_release_notes: false
 
       - name: 🧹 Cleanup
         if: always()
         run: rm -rf release_files .download_info 2>/dev/null || true
-
-      - name: 📈 Summary
-        if: always()
-        run: |
-          echo "## 📊 Workflow Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **File:** ${{ steps.download.outputs.filename }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Quality:** ${{ steps.validate.outputs.quality }}" >> $GITHUB_STEP_SUMMARY
