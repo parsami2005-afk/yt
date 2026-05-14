@@ -1,4 +1,4 @@
-name: Universal Media Downloader new
+name: Universal Media 2
 
 on:
   workflow_dispatch:
