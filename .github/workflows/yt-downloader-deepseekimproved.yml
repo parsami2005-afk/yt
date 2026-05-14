@@ -1,4 +1,4 @@
-name: yt download deepseek
+name: yt dl deepseek
 
 on:
   workflow_dispatch:
@@ -46,6 +46,15 @@ on:
         type: string
         default: '90'
 
+      always_zip:
+        description: 'همیشه فایل رو زیپ کن (برای عبور از فیلتر)'
+        required: true
+        type: choice
+        options:
+          - 'Yes (zip even if small)'
+          - 'No (keep as original)'
+        default: 'Yes (zip even if small)'
+
       upload_method:
         description: '📤 روش ذخیره نهایی'
         required: true
@@ -53,7 +62,7 @@ on:
         options:
           - repository (push to repo)
           - release (GitHub Releases)
-        default: 'repository (push to repo)'
+        default: 'release (GitHub Releases)'
 
       release_tag:
         description: '🏷️ نام تگ ریلیز (فقط در صورت انتخاب Release)'
@@ -178,7 +187,7 @@ jobs:
           fname = f"{clean}_{vid}_{quality_simple}.{FMT}"
 
           with open(".download_info", "w", encoding="utf-8") as f:
-              f.write(f"{dl_url}\n{fname}\n{title}")
+              f.write(f"{dl_url}\n{fname}\n{title}\n{QUAL}")
 
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"filename={fname}\n")
@@ -191,6 +200,7 @@ jobs:
           INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
 
       - name: 📥 Download File
+        id: download
         run: |
           DL_URL=$(head -1 .download_info)
           FILENAME=$(sed -n '2p' .download_info)
@@ -201,29 +211,72 @@ jobs:
             echo "::error::Downloaded file is empty!"
             exit 1
           fi
+          echo "original_filename=${FILENAME}" >> $GITHUB_OUTPUT
 
-      - name: ✂️ Split Large File (if needed)
+      - name: 📦 Process File (Split or Zip)
+        id: process
         run: |
-          FILENAME="${{ steps.retrieve.outputs.filename }}"
+          ORIG_FILENAME="${{ steps.download.outputs.original_filename }}"
           THRESH_MB="${{ github.event.inputs.max_part_mb }}"
+          ALWAYS_ZIP="${{ github.event.inputs.always_zip }}"
+          
           if [[ "$THRESH_MB" -le 0 ]] || [[ "$THRESH_MB" -gt 1900 ]]; then
             THRESH_MB=1800
           fi
-          FILESIZE=$(stat -c%s "release_files/$FILENAME" 2>/dev/null || echo 0)
-          THRESH_BYTES=$((THRESH_MB * 1024 * 1024))
-
-          if [ "$FILESIZE" -gt "$THRESH_BYTES" ]; then
-            echo "🔪 Splitting into ${THRESH_MB}MB parts..."
-            BASE="${FILENAME%.*}"
-            cd release_files
-            zip -r -s "${THRESH_MB}m" "${BASE}.zip" "./$FILENAME"
-            rm -- "$FILENAME"
-            cd ..
-            echo "Parts created:"
-            ls -lh release_files/
-          else
-            echo "📦 No split needed ($(( FILESIZE / 1024 / 1024 )) MB)"
+          
+          cd release_files
+          
+          # Check if file exists
+          if [ ! -f "$ORIG_FILENAME" ]; then
+            echo "::error::File $ORIG_FILENAME not found!"
+            exit 1
           fi
+          
+          FILESIZE=$(stat -c%s "$ORIG_FILENAME" 2>/dev/null || echo 0)
+          THRESH_BYTES=$((THRESH_MB * 1024 * 1024))
+          SIZE_MB=$((FILESIZE / 1024 / 1024))
+          
+          if [ "$FILESIZE" -gt "$THRESH_BYTES" ]; then
+            # Split into multiple parts
+            echo "🔪 File is ${SIZE_MB}MB - splitting into ${THRESH_MB}MB parts..."
+            BASE="${ORIG_FILENAME%.*}"
+            zip -r -s "${THRESH_MB}m" "${BASE}.zip" "./$ORIG_FILENAME"
+            if [ $? -ne 0 ]; then
+              echo "::error::Failed to split file!"
+              exit 1
+            fi
+            rm -- "$ORIG_FILENAME"
+            FINAL_FILENAME="${BASE}.zip"
+            echo "✅ Created split zip: ${FINAL_FILENAME}"
+          elif [ "$ALWAYS_ZIP" == "Yes (zip even if small)" ]; then
+            # Just zip the single file
+            echo "📦 File is ${SIZE_MB}MB - creating single zip (bypass blocks)..."
+            BASE="${ORIG_FILENAME%.*}"
+            zip "${BASE}.zip" "./$ORIG_FILENAME"
+            if [ $? -ne 0 ]; then
+              echo "::error::Failed to zip file!"
+              exit 1
+            fi
+            rm -- "$ORIG_FILENAME"
+            FINAL_FILENAME="${BASE}.zip"
+            echo "✅ Created zip: ${FINAL_FILENAME}"
+          else
+            # Keep as is
+            FINAL_FILENAME="$ORIG_FILENAME"
+            echo "✅ Keeping original file: ${FINAL_FILENAME}"
+          fi
+          
+          # Verify final file exists and has content
+          if [ ! -f "$FINAL_FILENAME" ] || [ ! -s "$FINAL_FILENAME" ]; then
+            echo "::error::Final file $FINAL_FILENAME is missing or empty!"
+            exit 1
+          fi
+          
+          echo "final_filename=${FINAL_FILENAME}" >> $GITHUB_OUTPUT
+          cd ..
+          
+          # Store for later use
+          echo "$FINAL_FILENAME" > .final_filename
 
       - name: 📅 Get Current Date
         id: get_date
@@ -232,12 +285,24 @@ jobs:
       - name: 📤 Push to Repository
         if: github.event.inputs.upload_method == 'repository (push to repo)'
         run: |
-          git config user.name  "github-actions[bot]"
+          FINAL_FILE=$(cat .final_filename)
+          
+          # Check file size for repository limit
+          FILESIZE=$(stat -c%s "release_files/$FINAL_FILE" 2>/dev/null || echo 0)
+          SIZE_MB=$((FILESIZE / 1024 / 1024))
+          
+          if [ $SIZE_MB -gt 90 ]; then
+            echo "::error::File is ${SIZE_MB}MB which exceeds GitHub repository limit of 100MB!"
+            echo "::error::Please use 'GitHub Releases' option for files this large."
+            exit 1
+          fi
+          
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           mkdir -p downloads
           mv release_files/* downloads/
           git add downloads/
-          git commit -m "⬇️ YouTube: ${{ steps.retrieve.outputs.filename }} [skip ci]" || echo "Nothing to commit"
+          git commit -m "⬇️ YouTube: $FINAL_FILE [skip ci]" || echo "Nothing to commit"
           git push
 
       - name: 📤 Upload to GitHub Releases
@@ -254,8 +319,11 @@ jobs:
             **Quality:** ${{ steps.retrieve.outputs.quality }}
             **Format:** ${{ github.event.inputs.output_format }}
             **Downloaded on:** ${{ steps.get_date.outputs.date }}
+            **File:** $(cat .final_filename 2>/dev/null || echo "unknown")
 
             ---
+            **Note:** If you see multiple files, download the .zip file (not "Source code"). Extract to get your video.
+            
             Powered by Meli-Action ⚡
           files: release_files/*
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -264,4 +332,4 @@ jobs:
 
       - name: 🧹 Cleanup
         if: always()
-        run: rm -rf release_files .download_info 2>/dev/null || true
+        run: rm -rf release_files .download_info .final_filename 2>/dev/null || true
