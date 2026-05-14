@@ -1,0 +1,280 @@
+name: Universal Media deepseek
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Media URL to download'
+        required: true
+        type: string
+      quality:
+        description: 'Video quality (best, 1080p, 720p, 480p, 360p, audio-only)'
+        required: true
+        type: choice
+        default: 'best'
+        options:
+          - 'best'
+          - '1080p'
+          - '720p'
+          - '480p'
+          - '360p'
+          - 'audio-only'
+      filename:
+        description: 'Custom filename (without extension)'
+        required: false
+        type: string
+        default: 'downloaded_media'
+      max_size_mb:
+        description: 'Maximum file size before splitting (MB)'
+        required: true
+        type: choice
+        default: '90'
+        options:
+          - '90'
+          - '50'
+          - '25'
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install yt-dlp
+        run: |
+          python -m pip install --upgrade pip
+          pip install yt-dlp
+
+      - name: Validate URL and prepare download
+        id: prepare
+        run: |
+          # Clean the URL
+          CLEAN_URL=$(echo "${{ github.event.inputs.url }}" | tr -d '[:space:]')
+          echo "clean_url=$CLEAN_URL" >> $GITHUB_OUTPUT
+          
+          # Create downloads directory
+          mkdir -p downloads
+          
+          # Set quality format based on selection
+          QUALITY="${{ github.event.inputs.quality }}"
+          case "$QUALITY" in
+            "best")
+              FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+              ;;
+            "1080p")
+              FORMAT="bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best"
+              ;;
+            "720p")
+              FORMAT="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best"
+              ;;
+            "480p")
+              FORMAT="bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best"
+              ;;
+            "360p")
+              FORMAT="bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best"
+              ;;
+            "audio-only")
+              FORMAT="bestaudio[ext=m4a]/bestaudio/best"
+              ;;
+            *)
+              FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+              ;;
+          esac
+          echo "format=$FORMAT" >> $GITHUB_OUTPUT
+          echo "quality_name=$QUALITY" >> $GITHUB_OUTPUT
+
+      - name: Download media using yt-dlp
+        id: download
+        continue-on-error: false
+        run: |
+          # Set the output template
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          OUTPUT_TEMPLATE="downloads/${{ github.event.inputs.filename }}_${TIMESTAMP}.%(ext)s"
+          
+          # Download with yt-dlp
+          yt-dlp \
+            --format "${{ steps.prepare.outputs.format }}" \
+            --output "$OUTPUT_TEMPLATE" \
+            --merge-output-format mp4 \
+            --no-check-certificates \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            --no-warnings \
+            --progress \
+            --print filename \
+            "${{ steps.prepare.outputs.clean_url }}" > downloaded_file.txt 2>&1 || {
+              echo "Download failed, trying with alternative options..."
+              # Retry with less strict format
+              yt-dlp \
+                --format "best[ext=mp4]/best" \
+                --output "$OUTPUT_TEMPLATE" \
+                --merge-output-format mp4 \
+                --no-check-certificates \
+                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                --no-warnings \
+                --progress \
+                --print filename \
+                "${{ steps.prepare.outputs.clean_url }}" > downloaded_file.txt 2>&1
+            }
+          
+          # Get the actual downloaded filename
+          DOWNLOADED_FILE=$(tail -n 1 downloaded_file.txt)
+          if [ ! -f "$DOWNLOADED_FILE" ]; then
+            # Try to find any downloaded file
+            DOWNLOADED_FILE=$(ls -t downloads/*.mp4 downloads/*.m4a downloads/*.webm downloads/*.mkv 2>/dev/null | head -n 1)
+          fi
+          
+          if [ -z "$DOWNLOADED_FILE" ] || [ ! -f "$DOWNLOADED_FILE" ]; then
+            echo "Error: No file was downloaded"
+            exit 1
+          fi
+          
+          echo "downloaded_file=$DOWNLOADED_FILE" >> $GITHUB_OUTPUT
+          echo "Downloaded: $DOWNLOADED_FILE"
+          
+          # Get file size in MB
+          FILE_SIZE=$(du -m "$DOWNLOADED_FILE" | cut -f1)
+          echo "file_size_mb=$FILE_SIZE" >> $GITHUB_OUTPUT
+          echo "File size: ${FILE_SIZE}MB"
+
+      - name: Process large files (split if needed)
+        id: process
+        if: steps.download.outcome == 'success'
+        run: |
+          MAX_SIZE=${{ github.event.inputs.max_size_mb }}
+          FILE="${{ steps.download.outputs.downloaded_file }}"
+          FILE_SIZE=${{ steps.download.outputs.file_size_mb }}
+          BASENAME=$(basename "$FILE")
+          DIRNAME=$(dirname "$FILE")
+          
+          echo "Processing file: $BASENAME (${FILE_SIZE}MB)"
+          
+          if [ "$FILE_SIZE" -gt "$MAX_SIZE" ]; then
+            echo "File exceeds ${MAX_SIZE}MB limit. Splitting into parts..."
+            
+            # Create split directory
+            SPLIT_DIR="${DIRNAME}/${BASENAME%.*}_split"
+            mkdir -p "$SPLIT_DIR"
+            
+            # Calculate split size (slightly under limit to account for zip overhead)
+            SPLIT_SIZE="${MAX_SIZE}M"
+            
+            # Split the file
+            split -b "$SPLIT_SIZE" -d "$FILE" "${SPLIT_DIR}/${BASENAME}.part_"
+            
+            # Create zip files for each part
+            cd "$SPLIT_DIR"
+            PARTS=0
+            for part in ${BASENAME}.part_*; do
+              PARTS=$((PARTS + 1))
+              ZIP_NAME="${BASENAME}.part${PARTS}.zip"
+              zip -9 "$ZIP_NAME" "$part"
+              # Verify zip is under limit
+              ZIP_SIZE=$(du -m "$ZIP_NAME" | cut -f1)
+              if [ "$ZIP_SIZE" -gt "$MAX_SIZE" ]; then
+                echo "Warning: Zip part $PARTS is ${ZIP_SIZE}MB, over ${MAX_SIZE}MB limit"
+              fi
+              rm "$part"
+            done
+            cd ../..
+            
+            echo "split=true" >> $GITHUB_OUTPUT
+            echo "split_dir=$SPLIT_DIR" >> $GITHUB_OUTPUT
+            echo "total_parts=$PARTS" >> $GITHUB_OUTPUT
+            echo "File split into $PARTS parts"
+          else
+            echo "File size is within limits"
+            echo "split=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload files to repository
+        id: upload
+        if: steps.download.outcome == 'success'
+        run: |
+          # Configure git
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Create downloads directory in repo
+          DOWNLOADS_DIR="downloads"
+          QUALITY="${{ github.event.inputs.quality }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          UPLOAD_DIR="${DOWNLOADS_DIR}/${TIMESTAMP}_${QUALITY}"
+          mkdir -p "$UPLOAD_DIR"
+          
+          if [ "${{ steps.process.outputs.split }}" = "true" ]; then
+            # Copy split files to upload directory
+            cp "${{ steps.process.outputs.split_dir }}"/*.zip "$UPLOAD_DIR/"
+            
+            # Create metadata file
+            cat > "${UPLOAD_DIR}/metadata.txt" << EOF
+          Original URL: ${{ github.event.inputs.url }}
+          Quality: ${{ github.event.inputs.quality }}
+          Original Filename: $(basename "${{ steps.download.outputs.downloaded_file }}")
+          Download Date: $(date)
+          File Size: ${{ steps.download.outputs.file_size_mb }}MB
+          Split into: ${{ steps.process.outputs.total_parts }} parts
+          Max part size: ${{ github.event.inputs.max_size_mb }}MB
+          
+          To recombine on Linux/Mac:
+          cat $(basename "${{ steps.download.outputs.downloaded_file }}").part*.zip > combined.zips
+          unzip combined.zips (you'll need to extract each part's content)
+          
+          To recombine on Windows:
+          copy /b part1.zip+part2.zip+... combined.zip
+          Then extract combined.zip
+          EOF
+            
+            # Cleanup split directory
+            rm -rf "${{ steps.process.outputs.split_dir }}"
+          else
+            # Copy single file
+            cp "${{ steps.download.outputs.downloaded_file }}" "$UPLOAD_DIR/"
+          fi
+          
+          # Stage and commit files
+          git add "$UPLOAD_DIR"
+          git commit -m "Download: $(basename "${{ steps.download.outputs.downloaded_file }}") [${QUALITY}]"
+          git push
+          
+          echo "upload_dir=$UPLOAD_DIR" >> $GITHUB_OUTPUT
+
+      - name: Create summary
+        if: always()
+        run: |
+          echo "## Media Download Summary" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** ${{ github.event.inputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Quality:** ${{ github.event.inputs.quality }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.download.outcome }}" = "success" ]; then
+            echo "**Status:** ✅ Download successful" >> $GITHUB_STEP_SUMMARY
+            echo "**File Size:** ${{ steps.download.outputs.file_size_mb }}MB" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "${{ steps.process.outputs.split }}" = "true" ]; then
+              echo "**Processing:** Split into ${{ steps.process.outputs.total_parts }} zip parts" >> $GITHUB_STEP_SUMMARY
+              echo "**Location:** ${{ steps.upload.outputs.upload_dir }}" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "**Processing:** Single file (no split needed)" >> $GITHUB_STEP_SUMMARY
+              echo "**Location:** ${{ steps.upload.outputs.upload_dir }}" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "**Status:** ❌ Download failed" >> $GITHUB_STEP_SUMMARY
+            echo "**Error:** Check the workflow logs for details" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Cleanup workspace
+        if: always()
+        run: |
+          rm -rf downloads/* 2>/dev/null || true
+          rm -f downloaded_file.txt 2>/dev/null || true
