@@ -1,0 +1,399 @@
+name: Un4444
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Direct download URL (must be accessible or use GitHub raw URL)'
+        required: true
+        type: string
+      quality:
+        description: 'File type/quality selector'
+        required: true
+        type: choice
+        default: 'original'
+        options:
+          - 'original'
+          - 'compressed'
+          - 'archive'
+      filename:
+        description: 'Custom filename (without extension)'
+        required: false
+        type: string
+        default: 'received_media'
+      max_size_mb:
+        description: 'Maximum file size before splitting (MB)'
+        required: true
+        type: choice
+        default: '90'
+        options:
+          - '90'
+          - '50'
+          - '25'
+      source_type:
+        description: 'Source type'
+        required: true
+        type: choice
+        default: 'direct-url'
+        options:
+          - 'direct-url'
+          - 'github-release'
+          - 'github-raw'
+          - 'base64-input'
+
+jobs:
+  receive-and-process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install minimal dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pyyaml
+
+      - name: Download and process file
+        id: download
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import os
+          import sys
+          import base64
+          import hashlib
+          import json
+          import urllib.request
+          import urllib.parse
+          import ssl
+          from datetime import datetime
+          
+          # Get inputs
+          url = """${{ github.event.inputs.url }}""".strip()
+          quality = """${{ github.event.inputs.quality }}""".strip()
+          filename = """${{ github.event.inputs.filename }}""".strip()
+          max_size = int("""${{ github.event.inputs.max_size_mb }}""")
+          source_type = """${{ github.event.inputs.source_type }}""".strip()
+          
+          # GitHub API details
+          repo = os.environ.get('GITHUB_REPOSITORY', '')
+          token = os.environ.get('GITHUB_TOKEN', '')
+          api_url = "https://api.github.com"
+          
+          print(f"Source type: {source_type}")
+          print(f"Quality setting: {quality}")
+          print(f"Max size: {max_size}MB")
+          
+          # Create download directory
+          os.makedirs('downloads', exist_ok=True)
+          
+          # SSL context that only trusts github.com
+          ssl_context = ssl.create_default_context()
+          
+          def download_from_github_raw(raw_url):
+              """Download from GitHub raw URL"""
+              print(f"Downloading from GitHub raw: {raw_url}")
+              
+              # Parse URL to ensure it's github.com
+              parsed = urllib.parse.urlparse(raw_url)
+              if 'github.com' not in parsed.netloc:
+                  print("Error: Only github.com URLs are allowed")
+                  sys.exit(1)
+              
+              # Convert to raw URL if needed
+              if 'raw.githubusercontent.com' not in parsed.netloc:
+                  # Convert github.com/blob/ to raw.githubusercontent.com/
+                  raw_url = raw_url.replace('github.com/', 'raw.githubusercontent.com/')
+                  raw_url = raw_url.replace('/blob/', '/')
+              
+              try:
+                  req = urllib.request.Request(raw_url)
+                  req.add_header('Authorization', f'token {token}')
+                  req.add_header('User-Agent', 'GitHub-Actions')
+                  
+                  with urllib.request.urlopen(req, context=ssl_context) as response:
+                      content = response.read()
+                      
+                  # Save file
+                  output_path = os.path.join('downloads', filename)
+                  with open(output_path, 'wb') as f:
+                      f.write(content)
+                  
+                  print(f"Downloaded to: {output_path}")
+                  return output_path
+                  
+              except Exception as e:
+                  print(f"Download failed: {e}")
+                  sys.exit(1)
+          
+          def download_from_github_release(release_url):
+              """Download from GitHub Release"""
+              print(f"Downloading from GitHub Release: {release_url}")
+              
+              parsed = urllib.parse.urlparse(release_url)
+              if 'github.com' not in parsed.netloc:
+                  print("Error: Only github.com URLs are allowed")
+                  sys.exit(1)
+              
+              # Extract owner/repo from URL
+              path_parts = parsed.path.strip('/').split('/')
+              if len(path_parts) >= 2:
+                  owner = path_parts[0]
+                  repo_name = path_parts[1]
+              else:
+                  # Use current repository
+                  owner, repo_name = repo.split('/')
+              
+              # Get latest release
+              releases_url = f"{api_url}/repos/{owner}/{repo_name}/releases/latest"
+              
+              try:
+                  req = urllib.request.Request(releases_url)
+                  req.add_header('Authorization', f'token {token}')
+                  req.add_header('Accept', 'application/vnd.github.v3+json')
+                  req.add_header('User-Agent', 'GitHub-Actions')
+                  
+                  with urllib.request.urlopen(req, context=ssl_context) as response:
+                      release_data = json.loads(response.read())
+                  
+                  # Download first asset
+                  if release_data.get('assets'):
+                      asset = release_data['assets'][0]
+                      download_url = asset['browser_download_url']
+                      
+                      req = urllib.request.Request(download_url)
+                      req.add_header('Authorization', f'token {token}')
+                      req.add_header('Accept', 'application/octet-stream')
+                      req.add_header('User-Agent', 'GitHub-Actions')
+                      
+                      with urllib.request.urlopen(req, context=ssl_context) as response:
+                          content = response.read()
+                      
+                      output_path = os.path.join('downloads', asset['name'])
+                      with open(output_path, 'wb') as f:
+                          f.write(content)
+                      
+                      print(f"Downloaded release asset: {output_path}")
+                      return output_path
+                  else:
+                      print("No assets found in release")
+                      sys.exit(1)
+                      
+              except Exception as e:
+                  print(f"Release download failed: {e}")
+                  sys.exit(1)
+          
+          def process_direct_url(direct_url):
+              """Process direct URL download"""
+              print(f"Processing direct URL: {direct_url}")
+              
+              parsed = urllib.parse.urlparse(direct_url)
+              
+              # Validate it's a github.com domain
+              if 'github.com' not in parsed.netloc and 'githubusercontent.com' not in parsed.netloc:
+                  print("Warning: URL is not from GitHub. Attempting download...")
+                  print("Note: This may fail if network restrictions are in place")
+              
+              try:
+                  req = urllib.request.Request(direct_url)
+                  req.add_header('User-Agent', 'GitHub-Actions')
+                  
+                  # Only use token for GitHub domains
+                  if 'github.com' in parsed.netloc or 'githubusercontent.com' in parsed.netloc:
+                      req.add_header('Authorization', f'token {token}')
+                  
+                  with urllib.request.urlopen(req, context=ssl_context, timeout=30) as response:
+                      content = response.read()
+                  
+                  # Generate filename from URL if not specified
+                  if filename == 'received_media':
+                      url_filename = os.path.basename(parsed.path) or 'downloaded_file'
+                      output_path = os.path.join('downloads', url_filename)
+                  else:
+                      output_path = os.path.join('downloads', filename)
+                  
+                  with open(output_path, 'wb') as f:
+                      f.write(content)
+                  
+                  print(f"Downloaded: {output_path}")
+                  return output_path
+                  
+              except Exception as e:
+                  print(f"Direct download failed: {e}")
+                  sys.exit(1)
+          
+          def process_base64_input(data_url):
+              """Process base64 encoded data"""
+              print("Processing base64 input...")
+              
+              # Remove data URL prefix if present
+              if ',' in data_url:
+                  data_url = data_url.split(',', 1)[1]
+              
+              try:
+                  content = base64.b64decode(data_url)
+                  
+                  output_path = os.path.join('downloads', filename)
+                  with open(output_path, 'wb') as f:
+                      f.write(content)
+                  
+                  print(f"Decoded base64 to: {output_path}")
+                  return output_path
+                  
+              except Exception as e:
+                  print(f"Base64 decode failed: {e}")
+                  sys.exit(1)
+          
+          # Process based on source type
+          if source_type == 'github-raw':
+              file_path = download_from_github_raw(url)
+          elif source_type == 'github-release':
+              file_path = download_from_github_release(url)
+          elif source_type == 'base64-input':
+              file_path = process_base64_input(url)
+          else:  # direct-url
+              file_path = process_direct_url(url)
+          
+          # Verify file exists
+          if not os.path.exists(file_path):
+              print("Error: File was not downloaded")
+              sys.exit(1)
+          
+          # Get file info
+          file_size = os.path.getsize(file_path)
+          file_size_mb = file_size / (1024 * 1024)
+          
+          print(f"File size: {file_size_mb:.2f}MB")
+          
+          # Apply quality processing if needed
+          if quality == 'archive':
+              import zipfile
+              zip_path = file_path + '.zip'
+              with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                  zf.write(file_path, os.path.basename(file_path))
+              file_path = zip_path
+              file_size = os.path.getsize(file_path)
+              file_size_mb = file_size / (1024 * 1024)
+              print(f"Archived size: {file_size_mb:.2f}MB")
+          
+          # Output results for GitHub Actions
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"downloaded_file={file_path}\n")
+              f.write(f"file_size_mb={file_size_mb:.0f}\n")
+              f.write(f"actual_size_bytes={file_size}\n")
+          
+          print("Download completed successfully!")
+          PYTHON_SCRIPT
+
+      - name: Split large files
+        id: split
+        if: steps.download.outcome == 'success'
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import os
+          import zipfile
+          from pathlib import Path
+          
+          file_path = """${{ steps.download.outputs.downloaded_file }}"""
+          max_size_mb = int("""${{ github.event.inputs.max_size_mb }}""")
+          file_size_mb = float("""${{ steps.download.outputs.file_size_mb }}""")
+          
+          print(f"Processing: {file_path} ({file_size_mb}MB)")
+          
+          if file_size_mb <= max_size_mb:
+              print("File within size limits, no split needed")
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                  f.write("split=false\n")
+              exit(0)
+          
+          print(f"Splitting into {max_size_mb}MB parts...")
+          
+          # Create split directory
+          split_dir = Path('downloads/split_parts')
+          split_dir.mkdir(exist_ok=True)
+          
+          # Read file in chunks and create zip parts
+          chunk_size = max_size_mb * 1024 * 1024
+          base_name = Path(file_path).name
+          part_num = 1
+          
+          with open(file_path, 'rb') as source:
+              while True:
+                  chunk = source.read(chunk_size)
+                  if not chunk:
+                      break
+                  
+                  # Create zip for this part
+                  part_name = f"{base_name}.part{part_num:03d}"
+                  zip_name = split_dir / f"{part_name}.zip"
+                  
+                  with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as zf:
+                      zf.writestr(part_name, chunk)
+                  
+                  zip_size = os.path.getsize(zip_name) / (1024 * 1024)
+                  print(f"Created part {part_num}: {zip_name} ({zip_size:.2f}MB)")
+                  part_num += 1
+          
+          total_parts = part_num - 1
+          print(f"Split complete: {total_parts} parts")
+          
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write("split=true\n")
+              f.write(f"split_dir={split_dir}\n")
+              f.write(f"total_parts={total_parts}\n")
+          PYTHON_SCRIPT
+
+      - name: Upload to repository
+        id: upload
+        if: steps.download.outcome == 'success'
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import os
+          import shutil
+          from datetime import datetime
+          from pathlib import Path
+          
+          # Setup paths
+          timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+          quality = """${{ github.event.inputs.quality }}"""
+          upload_dir = f"downloads/{timestamp}_{quality}"
+          
+          os.makedirs(upload_dir, exist_ok=True)
+          
+          # Check if file was split
+          split = """${{ steps.split.outputs.split }}""" == "true"
+          
+          if split:
+              # Copy split files
+              split_dir = """${{ steps.split.outputs.split_dir }}"""
+              total_parts = """${{ steps.split.outputs.total_parts }}"""
+              
+              for file in Path(split_dir).glob('*.zip'):
+                  shutil.copy2(file, upload_dir)
+              
+              # Create reassembly instructions
+              readme_content = f"""# Split File Information
+              
+              - **Original URL:** ${{ github.event.inputs.url }}
+              - **Parts:** {total_parts}
+              - **Date:** {datetime.now().isoformat()}
+              
+              ## Reassembly Instructions
+              
+              ### Linux/Mac:
+              ```bash
+              # Extract all parts
+              for f in *.part*.zip; do
+                  unzip "$f"
+              done
+              # Concatenate parts
+              cat *.part* > original_file
