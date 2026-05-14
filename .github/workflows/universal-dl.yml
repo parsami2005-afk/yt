@@ -1,0 +1,413 @@
+name: Universal Media Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      media_url:
+        description: '🔗 Media URL (YouTube, Twitter, Instagram, TikTok, etc.)'
+        required: true
+        type: string
+
+      output_format:
+        description: '📁 Output Format'
+        required: true
+        type: choice
+        options:
+          - 'mp4 (best video+audio)'
+          - 'mp3 (audio only)'
+          - 'best (automatic)'
+        default: 'mp4 (best video+audio)'
+
+      quality:
+        description: '📊 Quality Preference'
+        required: true
+        type: choice
+        options:
+          - 'best (highest available)'
+          - '1080p'
+          - '720p'
+          - '480p'
+          - '360p'
+          - 'worst (smallest size)'
+        default: 'best (highest available)'
+
+      max_part_mb:
+        description: '💾 Max part size in MB (0 = auto 1800MB)'
+        required: false
+        type: string
+        default: '90'
+
+      always_zip:
+        description: '📦 Always zip output?'
+        required: true
+        type: choice
+        options:
+          - 'Yes (zip always)'
+          - 'No (only if needed)'
+        default: 'Yes (zip always)'
+
+      upload_method:
+        description: '📤 Upload method'
+        required: true
+        type: choice
+        options:
+          - 'repository (push to repo)'
+          - 'release (GitHub Releases)'
+        default: 'release (GitHub Releases)'
+
+      release_tag:
+        description: '🏷️ Release tag (leave empty for auto)'
+        required: false
+        type: string
+        default: ''
+
+      custom_filename:
+        description: '📝 Custom filename (optional, without extension)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  universal-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 📂 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔧 Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg zip curl python3 python3-pip aria2
+          
+          # Install yt-dlp (supports 1000+ sites)
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+          
+          # Install atomicparsley for metadata
+          sudo apt-get install -y atomicparsley || true
+          
+          # Verify installation
+          yt-dlp --version
+
+      - name: 📋 Parse Input and Detect Site
+        id: parse
+        run: |
+          python3 << 'PYEOF'
+          import os, re, json
+          
+          URL = os.environ.get('MEDIA_URL', '')
+          FORMAT = os.environ.get('OUTPUT_FORMAT', '')
+          QUALITY = os.environ.get('QUALITY', '')
+          CUSTOM_NAME = os.environ.get('CUSTOM_FILENAME', '')
+          
+          # Detect site
+          site = "unknown"
+          if 'youtube.com' in URL or 'youtu.be' in URL:
+              site = "youtube"
+          elif 'twitter.com' in URL or 'x.com' in URL:
+              site = "twitter"
+          elif 'instagram.com' in URL:
+              site = "instagram"
+          elif 'tiktok.com' in URL:
+              site = "tiktok"
+          elif 'vimeo.com' in URL:
+              site = "vimeo"
+          elif 'twitch.tv' in URL:
+              site = "twitch"
+          elif 'reddit.com' in URL:
+              site = "reddit"
+          elif 'facebook.com' in URL or 'fb.com' in URL:
+              site = "facebook"
+          elif 'dailymotion.com' in URL:
+              site = "dailymotion"
+          elif 'bilibili.com' in URL:
+              site = "bilibili"
+          elif 'soundcloud.com' in URL:
+              site = "soundcloud"
+          elif 'spotify.com' in URL:
+              site = "spotify"
+          elif 'pinterest.com' in URL:
+              site = "pinterest"
+          elif 'v.redd.it' in URL:
+              site = "reddit"
+          
+          # Determine format flags
+          if FORMAT == 'mp3 (audio only)':
+              ytdl_format = 'mp3'
+              ext = 'mp3'
+          elif FORMAT == 'mp4 (best video+audio)':
+              ytdl_format = 'mp4'
+              ext = 'mp4'
+          else:
+              ytdl_format = 'best'
+              ext = 'mp4'
+          
+          # Quality mapping
+          quality_map = {
+              'best (highest available)': '0',
+              '1080p': '1080',
+              '720p': '720',
+              '480p': '480',
+              '360p': '360',
+              'worst (smallest size)': 'worst'
+          }
+          
+          quality_value = quality_map.get(QUALITY, '0')
+          
+          # Build output template
+          if CUSTOM_NAME:
+              safe_name = re.sub(r'[^\w\-_]', '_', CUSTOM_NAME)[:100]
+              output_template = f"{safe_name}.%(ext)s"
+          else:
+              output_template = "%(title).100s_%(id)s.%(ext)s"
+          
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"site={site}\n")
+              f.write(f"ytdl_format={ytdl_format}\n")
+              f.write(f"ext={ext}\n")
+              f.write(f"quality_value={quality_value}\n")
+              f.write(f"output_template={output_template}\n")
+          
+          # Save for later
+          with open('.parse_info', 'w') as f:
+              json.dump({
+                  'site': site,
+                  'format': ytdl_format,
+                  'ext': ext,
+                  'quality': quality_value,
+                  'template': output_template
+              }, f)
+          
+          print(f"✅ Detected site: {site}")
+          print(f"📊 Format: {ytdl_format}")
+          print(f"🎯 Quality: {QUALITY}")
+          PYEOF
+        env:
+          MEDIA_URL: ${{ github.event.inputs.media_url }}
+          OUTPUT_FORMAT: ${{ github.event.inputs.output_format }}
+          QUALITY: ${{ github.event.inputs.quality }}
+          CUSTOM_FILENAME: ${{ github.event.inputs.custom_filename }}
+
+      - name: ⬇️ Download Media with yt-dlp
+        id: download
+        run: |
+          mkdir -p downloads
+          cd downloads
+          
+          # Read parse info
+          SITE="${{ steps.parse.outputs.site }}"
+          FORMAT="${{ steps.parse.outputs.ytdl_format }}"
+          QUALITY="${{ steps.parse.outputs.quality_value }}"
+          TEMPLATE="${{ steps.parse.outputs.output_template }}"
+          
+          # Build yt-dlp command based on format
+          if [ "$FORMAT" == "mp3" ]; then
+            # Audio only
+            yt-dlp \
+              --extract-audio \
+              --audio-format mp3 \
+              --audio-quality 0 \
+              --embed-metadata \
+              --embed-thumbnail \
+              --add-metadata \
+              --output "$TEMPLATE" \
+              --no-playlist \
+              --retries 10 \
+              --fragment-retries 10 \
+              --socket-timeout 30 \
+              --no-check-certificates \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              "${{ github.event.inputs.media_url }}"
+          elif [ "$FORMAT" == "mp4" ]; then
+            # Video with format selection
+            if [ "$QUALITY" == "0" ]; then
+              # Best quality
+              yt-dlp \
+                -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
+                --merge-output-format mp4 \
+                --embed-metadata \
+                --embed-thumbnail \
+                --add-metadata \
+                --output "$TEMPLATE" \
+                --no-playlist \
+                --retries 10 \
+                --fragment-retries 10 \
+                --socket-timeout 30 \
+                --no-check-certificates \
+                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                "${{ github.event.inputs.media_url }}"
+            else
+              # Specific quality
+              yt-dlp \
+                -f "bestvideo[height<=${QUALITY}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${QUALITY}][ext=mp4]/best" \
+                --merge-output-format mp4 \
+                --embed-metadata \
+                --embed-thumbnail \
+                --add-metadata \
+                --output "$TEMPLATE" \
+                --no-playlist \
+                --retries 10 \
+                --fragment-retries 10 \
+                --socket-timeout 30 \
+                --no-check-certificates \
+                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                "${{ github.event.inputs.media_url }}"
+            fi
+          else
+            # Automatic best format
+            yt-dlp \
+              --embed-metadata \
+              --embed-thumbnail \
+              --add-metadata \
+              --output "$TEMPLATE" \
+              --no-playlist \
+              --retries 10 \
+              --fragment-retries 10 \
+              --socket-timeout 30 \
+              --no-check-certificates \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              "${{ github.event.inputs.media_url }}"
+          fi
+          
+          # Check if download succeeded
+          DOWNLOADED_FILE=$(ls -t | head -1)
+          if [ -z "$DOWNLOADED_FILE" ]; then
+            echo "::error::Download failed - no file found!"
+            exit 1
+          fi
+          
+          FILE_SIZE=$(stat -c%s "$DOWNLOADED_FILE" 2>/dev/null || echo 0)
+          if [ "$FILE_SIZE" -lt 1000 ]; then
+            echo "::error::Downloaded file is too small (${FILE_SIZE} bytes)!"
+            exit 1
+          fi
+          
+          echo "original_filename=$DOWNLOADED_FILE" >> $GITHUB_OUTPUT
+          echo "file_size=$FILE_SIZE" >> $GITHUB_OUTPUT
+          
+          echo "✅ Downloaded: $DOWNLOADED_FILE ($(( FILE_SIZE / 1024 / 1024 ))MB)"
+
+      - name: 📦 Process File (Split or Zip)
+        id: process
+        run: |
+          ORIG_FILE="${{ steps.download.outputs.original_filename }}"
+          THRESH_MB="${{ github.event.inputs.max_part_mb }}"
+          ALWAYS_ZIP="${{ github.event.inputs.always_zip }}"
+          
+          if [[ "$THRESH_MB" -le 0 ]] || [[ "$THRESH_MB" -gt 1900 ]]; then
+            THRESH_MB=1800
+          fi
+          
+          cd downloads
+          
+          if [ ! -f "$ORIG_FILE" ]; then
+            echo "::error::File $ORIG_FILE not found!"
+            exit 1
+          fi
+          
+          FILESIZE=$(stat -c%s "$ORIG_FILE" 2>/dev/null || echo 0)
+          THRESH_BYTES=$((THRESH_MB * 1024 * 1024))
+          SIZE_MB=$((FILESIZE / 1024 / 1024))
+          
+          if [ "$FILESIZE" -gt "$THRESH_BYTES" ]; then
+            # Split into parts
+            echo "🔪 Splitting ${SIZE_MB}MB file into ${THRESH_MB}MB parts..."
+            BASE="${ORIG_FILE%.*}"
+            zip -r -s "${THRESH_MB}m" "${BASE}.zip" "./$ORIG_FILE"
+            if [ $? -ne 0 ]; then
+              echo "::error::Failed to split file!"
+              exit 1
+            fi
+            rm -- "$ORIG_FILE"
+            FINAL_FILE="${BASE}.zip"
+            echo "✅ Created split archive: ${FINAL_FILE}"
+          elif [ "$ALWAYS_ZIP" == "Yes (zip always)" ]; then
+            # Zip it
+            echo "📦 Zipping ${SIZE_MB}MB file..."
+            BASE="${ORIG_FILE%.*}"
+            zip "${BASE}.zip" "./$ORIG_FILE"
+            if [ $? -ne 0 ]; then
+              echo "::error::Failed to zip file!"
+              exit 1
+            fi
+            rm -- "$ORIG_FILE"
+            FINAL_FILE="${BASE}.zip"
+            echo "✅ Created zip: ${FINAL_FILE}"
+          else
+            # Keep as is
+            FINAL_FILE="$ORIG_FILE"
+            echo "✅ Keeping original: ${FINAL_FILE}"
+          fi
+          
+          if [ ! -f "$FINAL_FILE" ] || [ ! -s "$FINAL_FILE" ]; then
+            echo "::error::Final file is missing or empty!"
+            exit 1
+          fi
+          
+          echo "final_filename=${FINAL_FILE}" >> $GITHUB_OUTPUT
+          echo "$FINAL_FILE" > ../.final_filename
+          
+          cd ..
+
+      - name: 📅 Get Current Date
+        id: get_date
+        run: echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
+      - name: 📤 Push to Repository
+        if: github.event.inputs.upload_method == 'repository (push to repo)'
+        run: |
+          FINAL_FILE=$(cat .final_filename)
+          FILESIZE=$(stat -c%s "downloads/$FINAL_FILE" 2>/dev/null || echo 0)
+          SIZE_MB=$((FILESIZE / 1024 / 1024))
+          
+          if [ $SIZE_MB -gt 90 ]; then
+            echo "::error::File is ${SIZE_MB}MB (exceeds 100MB repo limit)!"
+            echo "::error::Use 'GitHub Releases' for files larger than 100MB."
+            exit 1
+          fi
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p media_downloads
+          mv downloads/* media_downloads/
+          git add media_downloads/
+          git commit -m "⬇️ Media: $FINAL_FILE [skip ci]" || echo "Nothing to commit"
+          git push
+
+      - name: 📤 Upload to GitHub Releases
+        if: github.event.inputs.upload_method == 'release (GitHub Releases)'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('media-{0}', github.run_number) }}
+          name: ${{ format('Media Download #{0} - {1}', github.run_number, steps.parse.outputs.site) }}
+          body: |
+            **🌐 Universal Media Download**
+            
+            **📎 Source:** ${{ steps.parse.outputs.site }}
+            **🔗 URL:** ${{ github.event.inputs.media_url }}
+            **📁 Format:** ${{ github.event.inputs.output_format }}
+            **📊 Quality:** ${{ github.event.inputs.quality }}
+            **📅 Downloaded:** ${{ steps.get_date.outputs.date }}
+            **📄 File:** $(cat .final_filename 2>/dev/null || echo "unknown")
+            
+            ---
+            **💡 Tip:** If multiple files appear, download the .zip files (not "Source code").
+            
+            **Supported Sites:** YouTube, Twitter/X, Instagram, TikTok, Reddit, Facebook, Vimeo, Twitch, SoundCloud, Bilibili, Dailymotion, and 1000+ more!
+            
+            Powered by yt-dlp + GitHub Actions ⚡
+          files: downloads/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: false
+          prerelease: false
+
+      - name: 🧹 Cleanup
+        if: always()
+        run: rm -rf downloads .download_info .final_filename .parse_info 2>/dev/null || true
