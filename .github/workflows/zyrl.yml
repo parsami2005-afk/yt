@@ -1,0 +1,92 @@
+name: Download and Release Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'URL of the video to download'
+        required: true
+        type: string
+      quality:
+        description: 'Video quality (e.g., 1080, 720, 480, best)'
+        required: true
+        type: choice
+        options:
+          - 'best'
+          - '1080'
+          - '720'
+          - '480'
+          - '360'
+        default: '720'
+      tag_name:
+        description: 'Release tag (e.g., v1.0.0)'
+        required: true
+        type: string
+
+jobs:
+  download-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install yt-dlp
+        run: pip install yt-dlp
+
+      - name: Download video with quality selection
+        id: download
+        run: |
+          # Create downloads directory
+          mkdir -p downloads
+          
+          # Set quality format selector
+          if [ "${{ inputs.quality }}" = "best" ]; then
+            FORMAT="bestvideo+bestaudio/best"
+          else
+            FORMAT="bestvideo[height<=${{ inputs.quality }}]+bestaudio/best[height<=${{ inputs.quality }}]"
+          fi
+          
+          # Download the video
+          yt-dlp \
+            --format "$FORMAT" \
+            --merge-output-format mp4 \
+            --output "downloads/%(title)s.%(ext)s" \
+            --no-playlist \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            "${{ inputs.video_url }}"
+          
+          # Find the downloaded file
+          VIDEO_FILE=$(ls downloads/*.mp4 | head -n 1)
+          echo "video_file=$VIDEO_FILE" >> $GITHUB_OUTPUT
+          echo "video_name=$(basename "$VIDEO_FILE")" >> $GITHUB_OUTPUT
+
+      - name: Create Release and Upload
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          name: Video Release ${{ inputs.tag_name }}
+          files: ${{ steps.download.outputs.video_file }}
+          body: |
+            Downloaded video from: ${{ inputs.video_url }}
+            Quality: ${{ inputs.quality }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf downloads
